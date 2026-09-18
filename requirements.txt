@@ -1,0 +1,10 @@
+# VerifyVoice Python ML Backend Dependencies
+torch
+librosa
+soundfile
+numpy
+scipy
+matplotlib
+fastapi
+uvicorn
+python-multipart

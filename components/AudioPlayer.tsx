@@ -9,6 +9,7 @@ import SuspiciousRegionsPanel from '@/components/SuspiciousRegionsPanel'
 interface AudioPlayerProps {
   file: File | Blob
   suspiciousRegions?: SuspiciousRegion[]
+  previewMode?: boolean
 }
 
 function formatTime(seconds: number): string {
@@ -20,7 +21,7 @@ function formatTime(seconds: number): string {
 
 const SPEED_OPTIONS = [0.75, 1, 1.25, 1.5, 2]
 
-export default function AudioPlayer({ file, suspiciousRegions }: AudioPlayerProps) {
+export default function AudioPlayer({ file, suspiciousRegions, previewMode = false }: AudioPlayerProps) {
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const [audioUrl, setAudioUrl] = useState<string | null>(null)
 
@@ -243,13 +244,15 @@ export default function AudioPlayer({ file, suspiciousRegions }: AudioPlayerProp
         onSelectRegion={handleSelectRegion}
       />
 
-      {/* SUSPICIOUS REGIONS DETAILS PANEL */}
-      <SuspiciousRegionsPanel
-        suspiciousRegions={suspiciousRegions}
-        selectedRegionId={selectedRegionId}
-        onSelectRegion={handleSelectRegion}
-        onPlayRegion={handlePlayRegion}
-      />
+      {/* SUSPICIOUS REGIONS DETAILS PANEL (Omit in upload preview) */}
+      {!previewMode && (
+        <SuspiciousRegionsPanel
+          suspiciousRegions={suspiciousRegions}
+          selectedRegionId={selectedRegionId}
+          onSelectRegion={handleSelectRegion}
+          onPlayRegion={handlePlayRegion}
+        />
+      )}
     </div>
   )
 }

@@ -8,3 +8,15 @@ out/
 .env.production.local
 .DS_Store
 npm-debug.log*
+
+# Downloads and temp files
+*.crdownload
+backend/temp_gradcam/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/

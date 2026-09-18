@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "backend": "py backend/main.py",
     "build": "next build",
     "start": "next start",
     "lint": "eslint ."
