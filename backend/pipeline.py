@@ -234,13 +234,18 @@ def run_inference_pipeline(file_bytes: bytes, filename: str) -> Dict[str, Any]:
     best_tensor = chunk_tensors[best_chunk_idx]
     best_raw_mel = raw_specs[best_chunk_idx]
 
-    gradcam_filename = generate_gradcam_overlay(
-        model=model,
-        mel_tensor=best_tensor,
-        raw_mel_db=best_raw_mel,
-        device=device,
-        target_layer_idx=15
-    )
+    # Generate Grad-CAM on 512-channel Conv2D layer (layer 15)
+    try:
+        gradcam_filename = generate_gradcam_overlay(
+            model=model,
+            mel_tensor=best_tensor,
+            raw_mel_db=best_raw_mel,
+            device=device,
+            target_layer_idx=15
+        )
+        gradcam_url = f"/api/gradcam/{gradcam_filename}" if gradcam_filename else None
+    except Exception as e:
+        gradcam_url = None
 
     return {
         "success": True,

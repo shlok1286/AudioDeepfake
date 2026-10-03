@@ -1,12 +1,20 @@
 import os
 import sys
+import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("verifyvoice-backend")
 
 # Ensure the backend directory is in Python module search path
 backend_dir = Path(__file__).resolve().parent
@@ -19,27 +27,32 @@ from backend.gradcam import GRADCAM_DIR
 
 app = FastAPI(
     title="VerifyVoice ML Backend",
-    description="Deepfake Audio Detection API with 4-Layer CNN & Grad-CAM",
+    description="Production Deepfake Audio Detection API with 4-Layer CNN & Grad-CAM",
     version="1.0.0"
 )
 
-# Enable CORS for local Next.js frontend dev server and production origins
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+# Parse allowed CORS origins from environment
+def get_cors_origins() -> List[str]:
+    raw_origins = os.environ.get("ALLOWED_ORIGINS") or os.environ.get("FRONTEND_URL")
+    if raw_origins:
+        return [o.strip() for o in raw_origins.split(",") if o.strip()]
+    return [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
-        "*",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
+    ]
+
+origins = get_cors_origins()
+logger.info(f"Configuring CORS for origins: {origins}")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins if "*" not in origins else ["*"],
+    allow_credentials=True if "*" not in origins else False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
-
-
-import traceback
 
 
 @app.on_event("startup")
@@ -50,17 +63,18 @@ async def startup_event():
     """
     try:
         model, device, path = get_model()
-        print("=" * 65)
-        print(" VerifyVoice ML Inference Backend Running")
-        print(f"[*] Inference URL:  http://127.0.0.1:8000")
-        print(f"[*] Loaded Model:   {path}")
-        print(f"[*] Compute Device: {device}")
-        print(f"[*] Health Check:   http://127.0.0.1:8000/health")
-        print(f"[*] Predict Route:  POST http://127.0.0.1:8000/api/predict")
-        print("=" * 65)
+        host = os.environ.get("HOST", "0.0.0.0")
+        port = os.environ.get("PORT", "8000")
+        logger.info("=" * 65)
+        logger.info(" VerifyVoice ML Inference Backend Running")
+        logger.info(f"[*] Binding:        http://{host}:{port}")
+        logger.info(f"[*] Loaded Model:   {path}")
+        logger.info(f"[*] Compute Device: {device}")
+        logger.info(f"[*] Health Check:   /health")
+        logger.info(f"[*] Predict Route:  POST /api/predict")
+        logger.info("=" * 65)
     except Exception as e:
-        traceback.print_exc()
-        print(f"[!] Error loading model during startup: {e}", file=sys.stderr)
+        logger.error(f"[!] Critical error initializing model on startup: {e}", exc_info=True)
 
 
 @app.get("/health")
@@ -119,7 +133,8 @@ async def predict_audio(
         return JSONResponse(status_code=200, content=result)
 
     except ValueError as ve:
-        # Sanitized 400 user-facing error message
+        # Sanitized user-facing input validation error
+        logger.warning(f"Validation error for '{filename}': {ve}")
         return JSONResponse(
             status_code=400,
             content={
@@ -129,15 +144,14 @@ async def predict_audio(
             }
         )
     except Exception as e:
-        # Log complete internal detail and traceback for debugging
-        print(f"[Inference Error]: {e}", file=sys.stderr)
-        traceback.print_exc()
+        # Log complete internal detail on server, return safe user error
+        logger.error(f"Inference pipeline failure on '{filename}': {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
-                "error": f"Inference failed: {str(e)}",
-                "detail": f"Inference failed: {str(e)}"
+                "error": "Audio analysis could not be completed. Please ensure the recording is valid speech audio.",
+                "detail": "Inference server encountered an internal processing error."
             }
         )
 
@@ -148,7 +162,6 @@ async def get_gradcam_image(filename: str):
     Serves generated Grad-CAM spectrogram heatmap visualization images.
     Secured against directory traversal.
     """
-    # Sanitize filename
     safe_name = Path(filename).name
     target_file = GRADCAM_DIR / safe_name
 
@@ -163,4 +176,6 @@ async def get_gradcam_image(filename: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run("backend.main:app", host="127.0.0.1", port=8000, reload=False)
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("backend.main:app", host=host, port=port, reload=False)
