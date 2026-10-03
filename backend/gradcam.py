@@ -2,12 +2,13 @@ import os
 import time
 import uuid
 from pathlib import Path
+from typing import Any
+
 import numpy as np
-import torch
-import torch.nn as nn
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from scipy.ndimage import zoom
 
 GRADCAM_DIR = Path(__file__).resolve().parent / "temp_gradcam"
 GRADCAM_DIR.mkdir(parents=True, exist_ok=True)
@@ -27,10 +28,10 @@ def cleanup_old_gradcams(max_age_seconds: int = 900):
 
 
 def generate_gradcam_overlay(
-    model: nn.Module,
-    mel_tensor: torch.Tensor,
+    model: Any,
+    mel_tensor: Any,
     raw_mel_db: np.ndarray,
-    device: torch.device,
+    device: Any,
     target_layer_idx: int = 15,
 ) -> str:
     """
@@ -41,62 +42,111 @@ def generate_gradcam_overlay(
     """
     cleanup_old_gradcams()
 
-    # Enable gradients for the input chunk and target layer
-    input_tensor = mel_tensor.clone().detach().to(device)
-    input_tensor.requires_grad = True
+    cam_np = None
 
-    # Target the 512-channel Conv2D layer (layer 15 in features)
-    target_conv = model.features[target_layer_idx]
-    activations = []
-    gradients = []
+    # Check if model has PyTorch hook capability
+    if hasattr(model, 'features') and hasattr(model, 'zero_grad'):
+        try:
+            import torch
+            import torch.nn as nn
+            input_tensor = mel_tensor.clone().detach().to(device)
+            input_tensor.requires_grad = True
 
-    def fwd_hook(module, inp, out):
-        activations.append(out)
+            target_conv = model.features[target_layer_idx]
+            activations = []
+            gradients = []
 
-    def bwd_hook(module, grad_in, grad_out):
-        gradients.append(grad_out[0])
+            def fwd_hook(module, inp, out):
+                activations.append(out)
 
-    fwd_handle = target_conv.register_forward_hook(fwd_hook)
-    bwd_handle = target_conv.register_full_backward_hook(bwd_hook)
+            def bwd_hook(module, grad_in, grad_out):
+                gradients.append(grad_out[0])
 
-    try:
-        # Forward pass
-        logit = model(input_tensor)
+            fwd_handle = target_conv.register_forward_hook(fwd_hook)
+            bwd_handle = target_conv.register_full_backward_hook(bwd_hook)
 
-        # Backpropagate logit to obtain gradients at features[15]
-        model.zero_grad()
-        logit.backward()
+            try:
+                logit = model(input_tensor)
+                model.zero_grad()
+                logit.backward()
 
-        act = activations[0].detach()  # [1, 512, H_feat, W_feat]
-        grad = gradients[0].detach()   # [1, 512, H_feat, W_feat]
+                act = activations[0].detach()
+                grad = gradients[0].detach()
+                weights = torch.mean(grad, dim=(2, 3), keepdim=True)
+                cam = torch.sum(weights * act, dim=1, keepdim=True)
+                cam = torch.relu(cam)
 
-        # Global average pooling of gradients per channel (weights alpha_k)
-        weights = torch.mean(grad, dim=(2, 3), keepdim=True)  # [1, 512, 1, 1]
+                h, w = raw_mel_db.shape[0], raw_mel_db.shape[1]
+                cam = nn.functional.interpolate(cam, size=(h, w), mode='bilinear', align_corners=False)
+                cam_np = cam.squeeze().cpu().numpy()
 
-        # Weighted combination of activation maps
-        cam = torch.sum(weights * act, dim=1, keepdim=True)    # [1, 1, H_feat, W_feat]
+                denom = (cam_np.max() - cam_np.min())
+                if denom > 1e-8:
+                    cam_np = (cam_np - cam_np.min()) / denom
+                else:
+                    cam_np = np.zeros_like(cam_np)
+            finally:
+                fwd_handle.remove()
+                bwd_handle.remove()
+        except Exception as e:
+            cam_np = None
 
-        # Apply ReLU to keep only features that positively contributed
-        cam = torch.relu(cam)
+    # Analytical Grad-CAM for ONNX / NumPy engine
+    if cam_np is None:
+        try:
+            if hasattr(model, 'forward_with_features'):
+                logits, l15 = model.forward_with_features(mel_tensor)
+            else:
+                l15 = None
 
-        # Interpolate to the original Mel spectrogram resolution (128, 87)
-        h, w = mel_tensor.shape[2], mel_tensor.shape[3]
-        cam = nn.functional.interpolate(cam, size=(h, w), mode='bilinear', align_corners=False)
-        cam_np = cam.squeeze().cpu().numpy()
+            if l15 is not None and hasattr(model, 'state_dict'):
+                state_dict = model.state_dict
+                w1 = state_dict['classifier.1.weight']
+                b1 = state_dict['classifier.1.bias']
+                w2 = state_dict['classifier.4.weight']
+                b2 = state_dict['classifier.4.bias']
+                bn_gamma = state_dict['features.16.weight']
+                bn_var = state_dict['features.16.running_var']
+                bn_mean = state_dict['features.16.running_mean']
+                bn_beta = state_dict['features.16.bias']
 
-        # Min-max normalization
-        denom = (cam_np.max() - cam_np.min())
-        if denom > 1e-8:
-            cam_np = (cam_np - cam_np.min()) / denom
-        else:
-            cam_np = np.zeros_like(cam_np)
+                # Forward through BN16 -> ReLU -> MaxPool -> GAP -> Classifier
+                y = (l15[0] - bn_mean[:, None, None]) / np.sqrt(bn_var[:, None, None] + 1e-5) * bn_gamma[:, None, None] + bn_beta[:, None, None]
+                r = np.maximum(0, y)
 
-    finally:
-        fwd_handle.remove()
-        bwd_handle.remove()
+                h_pool, w_pool = r.shape[1] // 2, r.shape[2] // 2
+                mp = np.zeros((512, h_pool, w_pool), dtype=np.float32)
+                for i in range(h_pool):
+                    for j in range(w_pool):
+                        mp[:, i, j] = np.max(r[:, 2*i:2*i+2, 2*j:2*j+2], axis=(1, 2))
+                p = np.mean(mp, axis=(1, 2))
+                z1_pre = np.dot(w1, p) + b1
+                dz1 = w2[0] * (z1_pre > 0)
+                dp = np.dot(dz1, w1)
+                alpha = dp * (bn_gamma / np.sqrt(bn_var + 1e-5))
+
+                cam = np.zeros((l15.shape[2], l15.shape[3]), dtype=np.float32)
+                for c in range(512):
+                    cam += alpha[c] * l15[0, c]
+                cam = np.maximum(0, cam)
+
+                h_target, w_target = raw_mel_db.shape[0], raw_mel_db.shape[1]
+                cam_resized = zoom(cam, (h_target / cam.shape[0], w_target / cam.shape[1]), order=1)
+                if cam_resized.shape != (h_target, w_target):
+                    cam_resized = cam_resized[:h_target, :w_target]
+
+                denom = cam_resized.max() - cam_resized.min()
+                if denom > 1e-8:
+                    cam_np = (cam_resized - cam_resized.min()) / denom
+                else:
+                    cam_np = np.zeros_like(cam_resized)
+        except Exception as e:
+            cam_np = None
+
+    if cam_np is None:
+        cam_np = np.zeros_like(raw_mel_db, dtype=np.float32)
 
     # Render Mel Spectrogram + Grad-CAM Heatmap overlay
-    # Aesthetics: dark themed, crisp typography, clean borders
     plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(8, 3.5), dpi=150)
     fig.patch.set_facecolor('#0B0F19')
@@ -107,7 +157,7 @@ def generate_gradcam_overlay(
     norm_spec = (raw_mel_db - spec_min) / (spec_max - spec_min + 1e-8)
     ax.imshow(norm_spec, aspect='auto', origin='lower', cmap='magma', alpha=0.65)
 
-    # Grad-CAM heatmap overlay (inferno / jet colormap with transparency)
+    # Grad-CAM heatmap overlay
     im = ax.imshow(cam_np, aspect='auto', origin='lower', cmap='jet', alpha=0.45)
 
     # Colorbar styling

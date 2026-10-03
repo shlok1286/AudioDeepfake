@@ -1,16 +1,32 @@
 import io
 import math
 import os
+import sys
+import types
 import tempfile
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
+# Ensure numba doesn't fail on Windows Smart App Control if unsigned _devicearray is blocked
+if 'numba' not in sys.modules:
+    try:
+        import numba
+    except (ImportError, OSError):
+        numba_mock = types.ModuleType('numba')
+        numba_mock.jit = lambda *args, **kwargs: (lambda f: f)
+        numba_mock.njit = lambda *args, **kwargs: (lambda f: f)
+        numba_mock.vectorize = lambda *args, **kwargs: (lambda f: f)
+        numba_mock.guvectorize = lambda *args, **kwargs: (lambda f: f)
+        numba_mock.stencil = lambda *args, **kwargs: (lambda f: f)
+        numba_mock.cfunc = lambda *args, **kwargs: (lambda f: f)
+        numba_mock.prange = range
+        sys.modules['numba'] = numba_mock
+
 import librosa
 import numpy as np
 import soundfile as sf
-import torch
 
-from .model import get_model
+from .model import get_model, no_grad, _TORCH_AVAILABLE
 from .gradcam import generate_gradcam_overlay
 
 # Target audio specifications expected by the trained CNN
@@ -45,16 +61,13 @@ def load_audio_from_bytes(file_bytes: bytes, filename: str) -> np.ndarray:
     Decodes audio bytes into a 16 kHz mono floating-point numpy array.
     Uses soundfile or librosa fallback with safe temp file handling.
     """
-    # Try soundfile directly from memory buffer
     try:
         buffer = io.BytesIO(file_bytes)
         audio_data, sr = sf.read(buffer, always_2d=False, dtype='float32')
 
-        # Convert to mono if multi-channel
         if audio_data.ndim > 1:
             audio_data = np.mean(audio_data, axis=1)
 
-        # Resample if needed
         if sr != TARGET_SR:
             audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=TARGET_SR)
 
@@ -63,7 +76,6 @@ def load_audio_from_bytes(file_bytes: bytes, filename: str) -> np.ndarray:
     except Exception:
         pass
 
-    # Fallback: write to temporary file and load with librosa
     safe_ext = Path(filename).suffix.lower() if Path(filename).suffix else ".wav"
     if safe_ext not in SUPPORTED_EXTENSIONS:
         safe_ext = ".wav"
@@ -96,7 +108,6 @@ def slice_into_chunks(audio_data: np.ndarray) -> List[np.ndarray]:
     total_samples = len(audio_data)
 
     if total_samples <= CHUNK_SAMPLES:
-        # Pad short audio to exactly 2 seconds
         padded = np.zeros(CHUNK_SAMPLES, dtype=np.float32)
         padded[:total_samples] = audio_data
         return [padded]
@@ -108,7 +119,6 @@ def slice_into_chunks(audio_data: np.ndarray) -> List[np.ndarray]:
         chunks.append(chunk)
         start += CHUNK_STEP
 
-    # If there is remaining tail audio that wasn't included, create one last chunk padded to 2s
     if start < total_samples and (total_samples - start) > (TARGET_SR * 0.4):
         tail = audio_data[start:]
         tail_padded = np.zeros(CHUNK_SAMPLES, dtype=np.float32)
@@ -118,12 +128,11 @@ def slice_into_chunks(audio_data: np.ndarray) -> List[np.ndarray]:
     return chunks
 
 
-def compute_mel_spectrogram(chunk: np.ndarray) -> Tuple[torch.Tensor, np.ndarray]:
+def compute_mel_spectrogram(chunk: np.ndarray) -> Tuple[Any, np.ndarray]:
     """
     Converts a 2-second 16 kHz chunk into a normalized Mel spectrogram of shape [1, 1, 128, 63].
     Uses librosa.feature.melspectrogram, power_to_db, and (mel_db - mean) / (std + 1e-8) standardization.
     """
-    # hop_length=512 produces exactly 63 frames for 32,000 samples with n_fft=2048
     mel = librosa.feature.melspectrogram(
         y=chunk,
         sr=TARGET_SR,
@@ -133,10 +142,8 @@ def compute_mel_spectrogram(chunk: np.ndarray) -> Tuple[torch.Tensor, np.ndarray
         power=2.0
     )
 
-    # Convert to decibels
     mel_db = librosa.power_to_db(mel, ref=np.max)
 
-    # Ensure exact TARGET_FRAMES (63) frames via zero-pad or truncation if slightly off
     current_frames = mel_db.shape[1]
     if current_frames < TARGET_FRAMES:
         pad_width = TARGET_FRAMES - current_frames
@@ -144,16 +151,19 @@ def compute_mel_spectrogram(chunk: np.ndarray) -> Tuple[torch.Tensor, np.ndarray
     elif current_frames > TARGET_FRAMES:
         mel_db = mel_db[:, :TARGET_FRAMES]
 
-    # Save raw un-normalized mel_db for Grad-CAM background visualization
     raw_mel_db = mel_db.copy()
 
-    # Per-spectrogram mean and std normalization: (mel_db - mel_db.mean()) / (mel_db.std() + 1e-8)
     mean = mel_db.mean()
     std = mel_db.std()
     mel_norm = (mel_db - mean) / (std + 1e-8)
 
-    # Shape: [1, 1, 128, 63]
-    tensor = torch.tensor(mel_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    # Return torch tensor if PyTorch is active, else numpy array [1, 1, 128, 63]
+    if _TORCH_AVAILABLE:
+        import torch
+        tensor = torch.tensor(mel_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    else:
+        tensor = mel_norm[np.newaxis, np.newaxis, :, :].astype(np.float32)
+
     return tensor, raw_mel_db
 
 
@@ -164,7 +174,7 @@ def run_inference_pipeline(file_bytes: bytes, filename: str) -> Dict[str, Any]:
     2. Load and resample to 16 kHz mono
     3. Split into 2-sec chunks with 50% overlap
     4. Compute Mel spectrograms [1, 1, 128, 63]
-    5. Run PyTorch CNN inference on all chunks
+    5. Run PyTorch / ONNX CNN inference on all chunks
     6. Aggregate predictions using average fake probability
     7. Generate Grad-CAM on final 512-ch Conv2D layer
     8. Return JSON payload matching specifications
@@ -182,46 +192,48 @@ def run_inference_pipeline(file_bytes: bytes, filename: str) -> Dict[str, Any]:
     chunk_tensors = []
     raw_specs = []
 
-    # Process all chunks
     for chunk in chunks:
         tensor, raw_mel = compute_mel_spectrogram(chunk)
         chunk_tensors.append(tensor)
         raw_specs.append(raw_mel)
 
-        with torch.no_grad():
-            logit = model(tensor.to(device))
-            fake_prob = torch.sigmoid(logit).item()
+        with no_grad():
+            if hasattr(tensor, 'to'):
+                input_data = tensor.to(device)
+            else:
+                input_data = tensor
+
+            logit = model(input_data)
+            if hasattr(logit, 'item'):
+                logit_val = logit.item()
+            elif isinstance(logit, np.ndarray):
+                logit_val = float(logit[0, 0])
+            else:
+                logit_val = float(logit)
+
+            fake_prob = float(1.0 / (1.0 + math.exp(-logit_val)))
             chunk_probs.append(fake_prob)
 
-    # Audio-level aggregation: average Fake probability across chunks
     avg_fake_prob = float(np.mean(chunk_probs))
     avg_real_prob = float(1.0 - avg_fake_prob)
 
     # 0.5 Threshold classification
     prediction = "FAKE" if avg_fake_prob >= 0.5 else "REAL"
 
-    # Confidence calculation:
-    # If FAKE: confidence is fake_prob * 100
-    # If REAL: confidence is (1 - fake_prob) * 100
     confidence_val = (avg_fake_prob if prediction == "FAKE" else avg_real_prob) * 100.0
     confidence_val = round(confidence_val, 2)
     fake_prob_percent = round(avg_fake_prob * 100.0, 2)
     real_prob_percent = round(avg_real_prob * 100.0, 2)
 
     # Select representative chunk for Grad-CAM
-    # Choose the chunk whose probability is closest to the aggregate prediction
-    # or the most confident chunk corresponding to the verdict
     if prediction == "FAKE":
-        # Chunk with highest fake probability
         best_chunk_idx = int(np.argmax(chunk_probs))
     else:
-        # Chunk with lowest fake probability (highest real)
         best_chunk_idx = int(np.argmin(chunk_probs))
 
     best_tensor = chunk_tensors[best_chunk_idx]
     best_raw_mel = raw_specs[best_chunk_idx]
 
-    # Generate Grad-CAM on 512-channel Conv2D layer (layer 15)
     gradcam_filename = generate_gradcam_overlay(
         model=model,
         mel_tensor=best_tensor,
