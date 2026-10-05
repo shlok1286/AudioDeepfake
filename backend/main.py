@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import Optional, List
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -25,10 +26,35 @@ from backend.model import get_model
 from backend.pipeline import run_inference_pipeline, validate_audio_file
 from backend.gradcam import GRADCAM_DIR
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Pre-loads model checkpoint on backend startup.
+    Ensures model is only initialized once and ready for inference.
+    """
+    try:
+        model, device, path = get_model()
+        host = os.environ.get("HOST", "0.0.0.0")
+        port = os.environ.get("PORT", "8000")
+        logger.info("=" * 65)
+        logger.info(" VerifyVoice ML Inference Backend Running")
+        logger.info(f"[*] Binding:        http://{host}:{port}")
+        logger.info(f"[*] Loaded Model:   {path}")
+        logger.info(f"[*] Compute Device: {device}")
+        logger.info(f"[*] Health Check:   /health")
+        logger.info(f"[*] Predict Route:  POST /api/predict")
+        logger.info("=" * 65)
+    except Exception as e:
+        logger.error(f"[!] Critical error initializing model on startup: {e}", exc_info=True)
+    yield
+
+
 app = FastAPI(
     title="VerifyVoice ML Backend",
     description="Production Deepfake Audio Detection API with 4-Layer CNN & Grad-CAM",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Parse allowed CORS origins from environment
@@ -53,28 +79,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-async def startup_event():
-    """
-    Pre-loads model checkpoint on backend startup.
-    Ensures model is only initialized once and ready for inference.
-    """
-    try:
-        model, device, path = get_model()
-        host = os.environ.get("HOST", "0.0.0.0")
-        port = os.environ.get("PORT", "8000")
-        logger.info("=" * 65)
-        logger.info(" VerifyVoice ML Inference Backend Running")
-        logger.info(f"[*] Binding:        http://{host}:{port}")
-        logger.info(f"[*] Loaded Model:   {path}")
-        logger.info(f"[*] Compute Device: {device}")
-        logger.info(f"[*] Health Check:   /health")
-        logger.info(f"[*] Predict Route:  POST /api/predict")
-        logger.info("=" * 65)
-    except Exception as e:
-        logger.error(f"[!] Critical error initializing model on startup: {e}", exc_info=True)
 
 
 @app.get("/health")
