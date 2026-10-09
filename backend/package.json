@@ -1,0 +1,9 @@
+{
+  "name": "verifyvoice-backend",
+  "version": "1.0.0",
+  "description": "VerifyVoice ML Inference Service",
+  "scripts": {
+    "dev": "node ../run-backend.js",
+    "start": "node ../run-backend.js"
+  }
+}

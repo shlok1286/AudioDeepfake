@@ -5,13 +5,41 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+_MATPLOTLIB_AVAILABLE = False
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    _MATPLOTLIB_AVAILABLE = True
+except Exception:
+    _MATPLOTLIB_AVAILABLE = False
+
 from scipy.ndimage import zoom
 
 GRADCAM_DIR = Path(__file__).resolve().parent / "temp_gradcam"
 GRADCAM_DIR.mkdir(parents=True, exist_ok=True)
+
+def _render_with_pil(cam_np: np.ndarray, raw_mel_db: np.ndarray, save_path: Path):
+    try:
+        from PIL import Image
+        spec_min, spec_max = raw_mel_db.min(), raw_mel_db.max()
+        norm_spec = (raw_mel_db - spec_min) / (spec_max - spec_min + 1e-8)
+        norm_spec = np.clip(norm_spec * 255, 0, 255).astype(np.uint8)
+
+        cam_u8 = np.clip(cam_np * 255, 0, 255).astype(np.uint8)
+        r = np.clip(norm_spec * 0.9 + cam_u8 * 1.2, 0, 255).astype(np.uint8)
+        g = np.clip(norm_spec * 0.3 + cam_u8 * 0.5, 0, 255).astype(np.uint8)
+        b = np.clip(norm_spec * 0.4 + (255 - cam_u8) * 0.3, 0, 255).astype(np.uint8)
+        rgb = np.stack([r, g, b], axis=-1)
+        rgb = np.flipud(rgb)
+        img = Image.fromarray(rgb)
+        img = img.resize((800, 350), Image.Resampling.BILINEAR)
+        img.save(save_path, format="PNG")
+    except Exception as e:
+        # Fallback to 1x1 black image if PIL also has issue
+        from PIL import Image
+        img = Image.new('RGB', (800, 350), color=(11, 15, 25))
+        img.save(save_path, format="PNG")
 
 
 def cleanup_old_gradcams(max_age_seconds: int = 900):
@@ -146,39 +174,48 @@ def generate_gradcam_overlay(
     if cam_np is None:
         cam_np = np.zeros_like(raw_mel_db, dtype=np.float32)
 
-    # Render Mel Spectrogram + Grad-CAM Heatmap overlay
-    plt.style.use('dark_background')
-    fig, ax = plt.subplots(figsize=(8, 3.5), dpi=150)
-    fig.patch.set_facecolor('#0B0F19')
-    ax.set_facecolor('#0B0F19')
-
-    # Base spectrogram
-    spec_min, spec_max = raw_mel_db.min(), raw_mel_db.max()
-    norm_spec = (raw_mel_db - spec_min) / (spec_max - spec_min + 1e-8)
-    ax.imshow(norm_spec, aspect='auto', origin='lower', cmap='magma', alpha=0.65)
-
-    # Grad-CAM heatmap overlay
-    im = ax.imshow(cam_np, aspect='auto', origin='lower', cmap='jet', alpha=0.45)
-
-    # Colorbar styling
-    cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.03)
-    cbar.ax.tick_params(labelsize=8, colors='#94A3B8')
-    cbar.outline.set_edgecolor('#1E293B')
-    cbar.set_label('Feature Attribution Intensity', fontsize=8, color='#94A3B8', labelpad=6)
-
-    ax.set_title('Acoustic Spectrogram Attribution (Grad-CAM Layer 15: Conv2D 512-ch)', fontsize=9.5, color='#F8FAFC', pad=8, fontweight='bold')
-    ax.set_xlabel('Temporal Frames (2-Second Window)', fontsize=8.5, color='#94A3B8')
-    ax.set_ylabel('Mel Frequency Bins (128)', fontsize=8.5, color='#94A3B8')
-    ax.tick_params(axis='both', which='major', labelsize=8, colors='#64748B')
-
-    for spine in ax.spines.values():
-        spine.set_color('#1E293B')
-
-    plt.tight_layout()
-
     filename = f"gradcam_{uuid.uuid4().hex[:12]}.png"
     save_path = GRADCAM_DIR / filename
-    plt.savefig(save_path, bbox_inches='tight', facecolor=fig.get_facecolor(), edgecolor='none', dpi=150)
-    plt.close(fig)
+
+    saved = False
+    if _MATPLOTLIB_AVAILABLE:
+        try:
+            # Render Mel Spectrogram + Grad-CAM Heatmap overlay
+            plt.style.use('dark_background')
+            fig, ax = plt.subplots(figsize=(8, 3.5), dpi=150)
+            fig.patch.set_facecolor('#0B0F19')
+            ax.set_facecolor('#0B0F19')
+
+            # Base spectrogram
+            spec_min, spec_max = raw_mel_db.min(), raw_mel_db.max()
+            norm_spec = (raw_mel_db - spec_min) / (spec_max - spec_min + 1e-8)
+            ax.imshow(norm_spec, aspect='auto', origin='lower', cmap='magma', alpha=0.65)
+
+            # Grad-CAM heatmap overlay
+            im = ax.imshow(cam_np, aspect='auto', origin='lower', cmap='jet', alpha=0.45)
+
+            # Colorbar styling
+            cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.03)
+            cbar.ax.tick_params(labelsize=8, colors='#94A3B8')
+            cbar.outline.set_edgecolor('#1E293B')
+            cbar.set_label('Feature Attribution Intensity', fontsize=8, color='#94A3B8', labelpad=6)
+
+            ax.set_title('Acoustic Spectrogram Attribution (Grad-CAM Layer 15: Conv2D 512-ch)', fontsize=9.5, color='#F8FAFC', pad=8, fontweight='bold')
+            ax.set_xlabel('Temporal Frames (2-Second Window)', fontsize=8.5, color='#94A3B8')
+            ax.set_ylabel('Mel Frequency Bins (128)', fontsize=8.5, color='#94A3B8')
+            ax.tick_params(axis='both', which='major', labelsize=8, colors='#64748B')
+
+            for spine in ax.spines.values():
+                spine.set_color('#1E293B')
+
+            plt.tight_layout()
+            plt.savefig(save_path, bbox_inches='tight', facecolor=fig.get_facecolor(), edgecolor='none', dpi=150)
+            plt.close(fig)
+            saved = True
+        except Exception:
+            saved = False
+
+    if not saved:
+        _render_with_pil(cam_np, raw_mel_db, save_path)
 
     return filename

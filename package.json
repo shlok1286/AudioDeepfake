@@ -4,8 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "backend": "python backend/main.py",
-    "dev:all": "npx --yes concurrently \"next dev\" \"python backend/main.py\"",
+    "backend": "node run-backend.js",
+    "dev:all": "npx --yes concurrently \"next dev\" \"node run-backend.js\"",
     "build": "next build",
     "start": "next start",
     "lint": "eslint ."

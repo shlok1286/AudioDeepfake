@@ -255,5 +255,5 @@ def run_inference_pipeline(file_bytes: bytes, filename: str) -> Dict[str, Any]:
         "fake_probability": fake_prob_percent,
         "real_probability": real_prob_percent,
         "chunks_analyzed": len(chunks),
-        "gradcam_url": f"/api/gradcam/{gradcam_filename}",
+        "gradcam_url": gradcam_url,
     }
